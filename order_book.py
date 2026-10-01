@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, Optional, TYPE_CHECKING
@@ -9,6 +10,8 @@ from typing import Dict, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from card import Card
     from player import Player
+
+logger = logging.getLogger(__name__)
 
 
 class OrderStatus(Enum):
@@ -63,6 +66,16 @@ class OrderHandle:
         self.status = status
         self.reason = reason
         self.trade = trade
+        logger.debug(
+            "Order %s %s %s @ %s player=%s -> %s%s",
+            self.order_id,
+            self.side,
+            self.asset,
+            self.price,
+            self.party.id,
+            status.name,
+            f" ({reason.name})" if reason is not None else "",
+        )
         if self.is_terminal() and self._done is not None and not self._done.done():
             self._done.set_result(self)
 
@@ -75,6 +88,12 @@ class Order:
     order_party: Player
     order_id: str
     handle: OrderHandle
+
+
+def _describe_order(order: Optional[Order]) -> str:
+    if order is None:
+        return "empty"
+    return f"{order.order_id}:{order.order_price}/p{order.order_party.id}"
 
 
 class OrderBook:
@@ -94,6 +113,12 @@ class OrderBook:
         if self.ask is not None:
             handles.append(self.ask.handle)
             self.ask = None
+        if handles:
+            logger.debug(
+                "Clearing %s | %s",
+                self.asset,
+                [f"{handle.order_id}:{handle.side}@{handle.price}/p{handle.party.id}" for handle in handles],
+            )
         return handles
 
     def process_order(self, handle: OrderHandle) -> dict:
@@ -107,10 +132,21 @@ class OrderBook:
           - "stale_handle": handle of a stale resting order that was removed (if any)
           - "stale_reason": RejectReason for the stale order (if any)
         """
+        logger.debug(
+            "Book %s incoming %s %s @ %s player=%s | bid=%s ask=%s",
+            self.asset,
+            handle.side,
+            handle.order_id,
+            handle.price,
+            handle.party.id,
+            _describe_order(self.bid),
+            _describe_order(self.ask),
+        )
         if handle.side == "BUY":
             return self._process_buy(handle)
         if handle.side == "SELL":
             return self._process_sell(handle)
+        logger.warning("Order %s has unknown side '%s'", handle.order_id, handle.side)
         return {"outcome": "rejected", "reason": RejectReason.WORSE_PRICE}
 
     def _process_buy(self, handle: OrderHandle) -> dict:
@@ -203,7 +239,17 @@ class OrderBook:
         if self.bid is not None and price <= self.bid.order_price:
             return {"outcome": "rejected", "reason": RejectReason.WORSE_PRICE}
 
-        # Rest the bid
+        if self.bid is not None:
+            logger.debug(
+                "Replacing bid on %s | dropped previous %s @ %s player=%s from the book | new %s @ %s player=%s",
+                self.asset,
+                self.bid.order_id,
+                self.bid.order_price,
+                self.bid.order_party.id,
+                handle.order_id,
+                price,
+                party.id,
+            )
         self.bid = Order("BUY", price, party, handle.order_id, handle)
         return {"outcome": "rested"}
 
@@ -219,7 +265,17 @@ class OrderBook:
         if self.ask is not None and price >= self.ask.order_price:
             return {"outcome": "rejected", "reason": RejectReason.WORSE_PRICE}
 
-        # Rest the ask
+        if self.ask is not None:
+            logger.debug(
+                "Replacing ask on %s | dropped previous %s @ %s player=%s from the book | new %s @ %s player=%s",
+                self.asset,
+                self.ask.order_id,
+                self.ask.order_price,
+                self.ask.order_party.id,
+                handle.order_id,
+                price,
+                party.id,
+            )
         self.ask = Order("SELL", price, party, handle.order_id, handle)
         return {"outcome": "rested"}
 
@@ -229,10 +285,29 @@ class OrderBook:
         from card import Card
 
         card = self._find_card(seller)
+        if card is None:
+            logger.error(
+                "Cannot settle %s | seller %s has no %s | buyer=%s price=%s",
+                order_id,
+                seller.id,
+                self.asset,
+                buyer.id,
+                price,
+            )
         seller.remove_card(card)
         buyer.add_card(card)
         buyer.cash -= price
         seller.cash += price
+        logger.info(
+            "Trade %s | %s x1 @ %s | buyer=%s cash=%.2f | seller=%s cash=%.2f",
+            order_id,
+            self.asset,
+            price,
+            buyer.id,
+            buyer.cash,
+            seller.id,
+            seller.cash,
+        )
 
         return {
             "id": order_id,
@@ -256,12 +331,27 @@ class OrderBook:
 
 
 class OrderBookManager:
-    def __init__(self, assets: list[str]):
+    def __init__(self, assets: list[str],logging_file: str=None):
         self.books: Dict[str, OrderBook] = {asset: OrderBook(asset) for asset in assets}
         self.order_queue: asyncio.Queue = asyncio.Queue()
         self.order_executed: list[dict] = []
         self._worker: Optional[asyncio.Task] = None
         self._order_id_counter = itertools.count(1)
+        self.logging_file = logging_file
+        self._round_trade_start = 0
+        logger.info("OrderBookManager created | assets=%s | trade_report=%s", assets, logging_file)
+        if self.logging_file is not None:
+            with open(self.logging_file, "a") as f:
+                f.write("Logging Report\n")
+                f.close()
+        
+    def _log_trades(self):
+        with open(self.logging_file, "a") as f:
+            last_trade = self.order_executed[-1]
+            with open(self.logging_file, "a") as f:
+                f.write(f"Last Trade: {last_trade}\n")
+                f.close()
+        
 
     async def submit_order(self, asset: str, side: str, price: float, party: Player) -> OrderHandle:
         """Submit an order and return a handle to track its outcome."""
@@ -274,6 +364,7 @@ class OrderBookManager:
             party=party,
         )
         await self.order_queue.put(handle)
+        logger.debug("Queued %s | %s %s @ %s | player=%s", order_id, side, asset, price, party.id)
         return handle
 
     def _cancel_all_quotes(self) -> None:
@@ -285,10 +376,12 @@ class OrderBookManager:
                     h._resolve(OrderStatus.CANCELLED)
 
     async def _matching_engine_worker(self) -> None:
+        logger.debug("Matching worker running")
         while True:
             item = await self.order_queue.get()
             try:
                 if item is None:
+                    logger.debug("Matching worker stopping")
                     return
 
                 handle: OrderHandle = item
@@ -324,25 +417,42 @@ class OrderBookManager:
                         "PRICE": trade["price"],
                         "ASSET": asset,
                     })
-
+                    self._log_trades()
+                
                 elif outcome == "rested":
                     handle._resolve(OrderStatus.RESTING)
 
                 elif outcome == "rejected":
                     handle._resolve(OrderStatus.REJECTED, result["reason"])
 
+            except Exception:
+                logger.exception("Matching worker failed while processing %s", item)
+                raise
             finally:
                 self.order_queue.task_done()
 
-    async def start(self) -> None:
+    async def start(self,round_number: int) -> None:
         await self.stop()
+        self._round_trade_start = len(self.order_executed)
         self._worker = asyncio.create_task(self._matching_engine_worker())
+        logger.info("Order book open | round=%s", round_number)
+        if self.logging_file is not None:
+            with open(self.logging_file, "a") as f:
+                f.write(f"Logging Report for Round {round_number}\n")
+                f.close()
 
     async def stop(self) -> None:
         worker = self._worker
         if worker is None:
             return
+        logger.info("Order book closing")
         await self.order_queue.put(None)
         await self.order_queue.join()
         await worker
         self._worker = None
+        traded = len(self.order_executed) - self._round_trade_start
+        logger.info(
+            "Order book closed | trades_this_round=%s | trades_total=%s",
+            traded,
+            len(self.order_executed),
+        )

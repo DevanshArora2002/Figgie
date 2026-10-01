@@ -9,3 +9,6 @@ class Card:
         self.suit = suit
         self.color = color
 
+    def __repr__(self) -> str:
+        return f"{self.suit}:{self.color}"
+
