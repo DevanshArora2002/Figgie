@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 import logging
+import math
 from utils import *
 from card import Card
 
@@ -14,6 +15,31 @@ if TYPE_CHECKING:
     from order_book import OrderBookManager
 
 logger = logging.getLogger(__name__)
+
+
+def _build_decks() -> list[dict]:
+    """The 12 Figgie decks: each suit count, the goal suit, its majority size, and its pot share."""
+    decks = []
+    seen: set[tuple[int, ...]] = set()
+    for counts in itertools.permutations(NO_CARDS):
+        if counts in seen:
+            continue
+        seen.add(counts)
+        counts_by_suit = dict(zip(SUITS, counts))
+        twelve_suit = next(suit for suit, count in counts_by_suit.items() if count == 12)
+        goal = next(suit for suit in color_to_suit[suit_to_color[twelve_suit]] if suit != twelve_suit)
+        goal_count = counts_by_suit[goal]
+        decks.append({
+            "counts": counts_by_suit,
+            "goal": goal,
+            "x": goal_count // 2 + 1,
+            "p": 4 * BOOT_AMOUNT - CASH_GAIN_PER_GOLDEN_CARD * goal_count,
+        })
+    return decks
+
+
+DECKS = _build_decks()
+
 
 class Player(ABC):
     _id_counter = itertools.count(1)
@@ -434,4 +460,405 @@ class BottomFeederPlayer(Player):
                     )
                     await order_book.submit_order(suit, side, float(price), self)
 
-            await asyncio.sleep(BOTTOM_FEEDER_TICK)    
+            await asyncio.sleep(BOTTOM_FEEDER_TICK)   
+
+class FundamentalistPlayer(Player):
+    """
+    Estimates each suit from the cards seen in the deal and in later trades.
+    Buy and sell use different values. The order price is drawn around the value
+    that matches the side, then rounded.
+    """
+
+    def _inventory_update(
+        self,
+        order_book: OrderBookManager,
+        inventory: dict[str, dict[int, int]],
+        history_obs: int = 0,
+    ) -> dict[str, dict[int, int]] | None:
+        if len(order_book.order_executed) <= history_obs:
+            return None
+        for his in order_book.order_executed[history_obs:]:
+            asset = his["ASSET"]
+            buyer_id = his["BUYER"]
+            seller_id = his["SELLER"]
+            asset_inventory = inventory.get(asset.lower())
+            asset_inventory.setdefault(seller_id, 0)
+            asset_inventory.setdefault(buyer_id, 0)
+            asset_inventory[seller_id] -= 1 if asset_inventory[seller_id] > 0 else 0
+            asset_inventory[buyer_id] += 1
+        return inventory
+
+    def _deck_distribution(self, inventory: dict[str, dict[int, int]]) -> list[float]:
+        """Posterior over the 12 decks, given how many distinct cards of each suit have been seen."""
+        seen = {suit: sum(inventory[suit].values()) for suit in SUITS}
+        weights = []
+        for deck in DECKS:
+            weight = 1
+            for suit in SUITS:
+                weight *= math.comb(deck["counts"][suit], seen[suit])
+            weights.append(weight)
+        total = sum(weights)
+        if total == 0:
+            return [0.0] * len(DECKS)
+        return [weight / total for weight in weights]
+
+    def _get_posterior_probability(
+        self,
+        inventory: dict[str, dict[int, int]],
+        suit: str,
+        deck_index: int | None = None,
+    ) -> float:
+        distribution = self._deck_distribution(inventory)
+        if deck_index is not None:
+            return distribution[deck_index]
+        return sum(prob for prob, deck in zip(distribution, DECKS) if deck["goal"] == suit)
+
+    def _card_value(self, deck: dict, suit: str, cards_held: int) -> float:
+        """Value of one more card of suit if this deck is the one in play."""
+        if deck["goal"] != suit or cards_held < 0:
+            return 0.0
+        if cards_held >= deck["x"]:
+            majority = 0.0
+        else:
+            growth = FUNDAMENTALIST_R
+            base = deck["p"] * (1 - growth) / (1 - growth ** deck["x"])
+            majority = base * (growth ** cards_held)
+        return CASH_GAIN_PER_GOLDEN_CARD + majority
+
+    def _get_expected_value(
+        self,
+        inventory: dict[str, dict[int, int]],
+        suit: str,
+        cards_held: int | None = None,
+    ) -> float:
+        if cards_held is None:
+            cards_held = self.get_cards_by_suit(suit)
+        distribution = self._deck_distribution(inventory)
+        return sum(
+            prob * self._card_value(deck, suit, cards_held)
+            for prob, deck in zip(distribution, DECKS)
+        )
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        np.random.seed(SEED)
+        inventory = {suit: {self.id: self.get_cards_by_suit(suit)} for suit in SUITS}
+        history_obs = 0
+        while True:
+            updated = self._inventory_update(order_book, inventory, history_obs)
+            if updated is not None:
+                inventory = updated
+            history_obs = len(order_book.order_executed)
+
+            suit = str(np.random.choice(SUITS))
+            held = self.get_cards_by_suit(suit)
+            buy_value = self._get_expected_value(inventory, suit, cards_held=held)
+            prob = np.random.uniform(0, 1)
+            side = "BUY" if prob < 0.5 else "SELL"
+
+            if side == "BUY" and buy_value > 0:
+                price = round(float(np.random.uniform(0, buy_value)))
+                offer = order_book.books[suit].ask
+                if offer is not None:
+                    price = min(price, round(offer.order_price))
+                if price >= 1 and self.cash >= price:
+                    logger.debug(
+                        "Player %s quoting %s %s @ %s | value=%.2f",
+                        self.id,
+                        side,
+                        suit,
+                        price,
+                        buy_value,
+                    )
+                    await order_book.submit_order(suit, side, float(price), self)
+            elif side == "SELL" and held > 0:
+                sell_value = self._get_expected_value(inventory, suit, cards_held=held - 1)
+                if sell_value > 0:
+                    price = round(float(np.random.uniform(sell_value, 2 * sell_value)))
+                    bid = order_book.books[suit].bid
+                    if bid is not None:
+                        price = max(price, round(bid.order_price))
+                    if price >= 1:
+                        logger.debug(
+                            "Player %s quoting %s %s @ %s | value=%.2f",
+                            self.id,
+                            side,
+                            suit,
+                            price,
+                            sell_value,
+                        )
+                        await order_book.submit_order(suit, side, float(price), self)
+
+            await asyncio.sleep(FUNDAMENTALIST_TICK)
+
+
+class FundamentalistPlayer2(FundamentalistPlayer):
+    """
+    A more directional play approach by combining a little bit of greedy approach.
+    """
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        """
+        Value-maximising Fundamentalist.
+
+        At every decision:
+        1. Update known-card inventory from observed trades.
+        2. Compute the correct posterior over the 12 possible decks.
+        3. Compute buy EV and sell EV for every suit.
+        4. Compare each EV with the current best ask / best bid.
+        5. Execute the feasible action with the largest positive expected surplus.
+
+        Buy edge:
+            buy_value - best_ask
+
+        Sell edge:
+            best_bid - sell_value
+        """
+        inventory = {suit: {self.id: self.get_cards_by_suit(suit)}for suit in SUITS}
+        history_obs = 0
+        while True:
+            updated = self._inventory_update(order_book,inventory,history_obs)
+            if updated is not None:
+                inventory = updated
+            history_obs = len(order_book.order_executed)
+            distribution = FundamentalistPlayer._deck_distribution(self,inventory)
+            
+            if sum(distribution) <= 0:
+                await asyncio.sleep(FUNDAMENTALIST_TICK)
+                continue
+
+            actions = []
+            for suit in SUITS:
+                held = self.get_cards_by_suit(suit)
+                buy_value = sum(prob * self._card_value(deck,suit,held) for prob, deck in zip(distribution, DECKS))
+                ask = order_book.books[suit].ask
+
+                if ask is not None:
+                    ask_price = float(ask.order_price)
+                    if (
+                        buy_value > 0
+                        and ask_price >= 1
+                        and self.cash >= ask_price
+                    ):
+                        buy_edge = buy_value - ask_price
+
+                        actions.append({
+                            "side": "BUY",
+                            "suit": suit,
+                            "edge": buy_edge,
+                            "price": ask_price,
+                            "value": buy_value,
+                        })
+                if held > 0:
+                    sell_value = sum(prob * self._card_value(deck,suit,held - 1) for prob, deck in zip(distribution, DECKS))
+                    bid = order_book.books[suit].bid
+                    
+                    if bid is not None:
+                        bid_price = float(bid.order_price)
+                        
+                        if bid_price >= 1:
+                            sell_edge = bid_price - sell_value
+
+                            actions.append({
+                                "side": "SELL",
+                                "suit": suit,
+                                "edge": sell_edge,
+                                "price": bid_price,
+                                "value": sell_value,
+                            })
+            profitable_actions = [
+                action
+                for action in actions
+                if action["edge"] > 0
+            ]
+            if not profitable_actions:
+                await asyncio.sleep(FUNDAMENTALIST_TICK)
+                continue
+            best_action = max(profitable_actions,key=lambda action: action["edge"])
+
+            side = best_action["side"]
+            suit = best_action["suit"]
+            price = best_action["price"]
+            value = best_action["value"]
+            edge = best_action["edge"]
+
+            logger.debug(
+                (
+                    "Player %s VALUE-MAX action | "
+                    "%s %s @ %.2f | fundamental_value=%.2f | edge=%.2f"
+                ),
+                self.id,
+                side,
+                suit,
+                price,
+                value,
+                edge,
+            )
+            await order_book.submit_order(
+                suit,
+                side,
+                price,
+                self
+            )
+            await asyncio.sleep(FUNDAMENTALIST_TICK)
+
+class FundamentalistPlayer3(FundamentalistPlayer):
+    """
+    Directional Fundamentalist.
+
+    Strategy:
+    1. Use card counting to calculate posterior probabilities
+       over the 12 possible decks.
+    2. Convert those deck probabilities into:
+           P(suit is goal | observed information)
+    3. BUY the suit(s) with maximum goal probability.
+    4. SELL the suit(s) with minimum goal probability,
+       if currently held.
+    5. Buy price is sampled between 1 and (buy_EV - 1).
+    6. Sell price is sampled between sell_EV and 2 * sell_EV.
+    """
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        inventory = {suit: {self.id: self.get_cards_by_suit(suit)} for suit in SUITS}
+        history_obs = 0
+        while True:
+            updated = self._inventory_update(order_book,inventory,history_obs)
+
+            if updated is not None:
+                inventory = updated
+
+            history_obs = len(order_book.order_executed)
+            distribution = self._deck_distribution(inventory)
+
+            if sum(distribution) <= 0:
+                await asyncio.sleep(FUNDAMENTALIST_TICK)
+                continue
+
+            goal_probability = {suit: 0.0 for suit in SUITS}
+
+            for prob, deck in zip(distribution, DECKS):
+                goal_suit = deck["goal"]
+
+                goal_probability[goal_suit] += prob
+
+            max_probability = max(goal_probability.values())
+            min_probability = min(goal_probability.values())
+
+            buy_suits = [
+                suit
+                for suit in SUITS
+                if np.isclose(
+                    goal_probability[suit],
+                    max_probability
+                )
+            ]
+
+            sell_suits = [
+                suit
+                for suit in SUITS
+                if np.isclose(
+                    goal_probability[suit],
+                    min_probability
+                )
+            ]
+
+            for suit in buy_suits:
+
+                held = self.get_cards_by_suit(suit)
+
+                buy_value = self._get_expected_value(
+                    inventory,
+                    suit,
+                    cards_held=held
+                )
+                
+                if buy_value <= 2:
+                    continue
+
+                price = float(
+                    np.random.uniform(
+                        1,
+                        buy_value - 1
+                    )
+                )
+
+                price = round(price)
+
+                if price < 1:
+                    continue
+
+                
+                if self.cash < price:
+                    continue
+
+                logger.debug(
+                    (
+                        "Player %s F3 BUY %s @ %s | "
+                        "P(goal)=%.4f | "
+                        "buy_EV=%.2f | held=%s"
+                    ),
+                    self.id,
+                    suit,
+                    price,
+                    goal_probability[suit],
+                    buy_value,
+                    held,
+                )
+
+                await order_book.submit_order(
+                    suit,
+                    "BUY",
+                    float(price),
+                    self
+                )
+
+
+            for suit in sell_suits:
+
+                held = self.get_cards_by_suit(suit)
+
+                if held <= 0:
+                    continue
+                
+                sell_value = self._get_expected_value(
+                    inventory,
+                    suit,
+                    cards_held=held - 1
+                )
+
+                if sell_value <= 0:
+                    continue
+
+                price = float(
+                    np.random.uniform(
+                        sell_value,
+                        2 * sell_value
+                    )
+                )
+
+                price = round(price)
+
+                if price < 1:
+                    continue
+
+                logger.debug(
+                    (
+                        "Player %s F3 SELL %s @ %s | "
+                        "P(goal)=%.4f | "
+                        "sell_EV=%.2f | held=%s"
+                    ),
+                    self.id,
+                    suit,
+                    price,
+                    goal_probability[suit],
+                    sell_value,
+                    held,
+                )
+
+                await order_book.submit_order(
+                    suit,
+                    "SELL",
+                    float(price),
+                    self
+                )
+
+            await asyncio.sleep(FUNDAMENTALIST_TICK)

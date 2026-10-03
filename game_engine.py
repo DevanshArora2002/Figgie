@@ -4,7 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 from utils import *
-from player import Player, GreedyPlayer, RandomPlayer, ChartistPlayer, BottomFeederPlayer
+from player import Player, GreedyPlayer, RandomPlayer, ChartistPlayer, BottomFeederPlayer, FundamentalistPlayer
 import random
 from card import Card
 from order_book import OrderBookManager
@@ -19,6 +19,7 @@ CLASS_REGISTRY = {
     "random": RandomPlayer,
     "chartist": ChartistPlayer,
     "bottom_feeder": BottomFeederPlayer,
+    "fundamentalist": FundamentalistPlayer,
 }
 
 

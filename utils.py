@@ -48,6 +48,11 @@ BOTTOM_FEEDER_TICK = 0.1
 # Buy orders and sell orders required from an agent before it counts as prey.
 BOTTOM_FEEDER_K = 4
 
+# Fundamentalist player constants
+FUNDAMENTALIST_TICK = 0.1
+# Growth of a card's majority value as the player nears a majority.
+FUNDAMENTALIST_R = 1.5
+
 
 def setup_logging(log_file: str = "figgie.log", console_level: int | None = None, file_level: int = logging.DEBUG) -> None:
     """Send INFO (or FIGGIE_LOG_LEVEL) to the console and DEBUG to log_file."""
