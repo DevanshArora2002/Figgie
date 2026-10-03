@@ -7,6 +7,7 @@ from card import Card
 
 from typing import TYPE_CHECKING
 import itertools
+import numpy as np
 
 if TYPE_CHECKING:
     from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -261,3 +262,176 @@ class GreedyPlayer(Player):
         finally:
             logger.info("Player %s left the market | %s", self.id, self)
 
+class RandomPlayer(Player):
+    """
+    A simple random player whose task is to chose the reward randomly from a uniform distribution.
+    """
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        np.set.seed(SEED)
+        while True:
+            prob = np.random.uniform(0, 1)
+            if prob < 0.5:
+                side = "BUY"
+            else:
+                side = "SELL"
+            
+            if side == "BUY":
+                price = int(np.random.uniform(RANDOM_MIN_OFFER, min(self.cash, RANDOM_MAX_BID)))
+                suit = np.random.choice(SUITS)
+                logger.debug(
+                        "Player %s quoting %s %s @ %s",
+                        self.id,
+                        side,
+                        suit,
+                        price,
+                    )
+                await order_book.submit_order(suit, side, price, self)
+            elif side == "SELL":
+                suit = np.random.choice(SUITS)
+                if self.get_cards_by_suit(suit) > 0:
+                    price = int(np.random.uniform(RANDOM_MIN_OFFER, RANDOM_MAX_BID))
+                    logger.debug(
+                        "Player %s quoting %s %s @ %s",
+                        self.id,
+                        side,
+                        suit,
+                        price,
+                    )
+                    await order_book.submit_order(suit, side, price, self)
+            await asyncio.sleep(RANDOM_TICK)
+
+class ChartistPlayer(Player):
+    """
+    Estimates each suit's future value from the average return of its trades.
+    Buy and sell are chosen at random. The quote is that future value, rounded.
+    """
+
+    def _trade_prices(self, order_book: OrderBookManager, suit: str) -> list[float]:
+        return [
+            trade["PRICE"]
+            for trade in order_book.order_executed
+            if trade["ASSET"] == suit
+        ]
+
+    def _expected_value(self, prices: list[float]) -> float | None:
+        """
+        Future value p_t * exp(r_bar * tau).
+
+        r_bar is the average log return over the last tau trades, which
+        telescopes to (1 / tau) * ln(p_{t-1} / p_{t-tau-1}).
+        """
+        tau = CHARTIST_TAU
+        if len(prices) < tau + 2:
+            return None
+        current = prices[-1]
+        previous = prices[-2]
+        horizon_start = prices[-(tau + 2)]
+        if current <= 0 or previous <= 0 or horizon_start <= 0:
+            return None
+        average_return = (1.0 / tau) * np.log(previous / horizon_start)
+        expected = float(current * np.exp(average_return * tau))
+        if not np.isfinite(expected):
+            return None
+        return expected
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        np.random.seed(SEED)
+        needed = CHARTIST_TAU + 2
+        while True:
+            prob = np.random.uniform(0, 1)
+            side = "BUY" if prob < 0.5 else "SELL"
+
+            ready = [
+                suit
+                for suit in SUITS
+                if len(self._trade_prices(order_book, suit)) >= needed
+            ]
+            if ready:
+                suit = str(np.random.choice(ready))
+                expected = self._expected_value(self._trade_prices(order_book, suit))
+                price = round(expected) if expected is not None else 0
+                can_buy = side == "BUY" and price >= 1 and self.cash >= price
+                can_sell = side == "SELL" and price >= 1 and self.get_cards_by_suit(suit) > 0
+                if can_buy or can_sell:
+                    logger.debug(
+                        "Player %s quoting %s %s @ %s | value=%.2f",
+                        self.id,
+                        side,
+                        suit,
+                        price,
+                        expected,
+                    )
+                    await order_book.submit_order(suit, side, float(price), self)
+
+            await asyncio.sleep(CHARTIST_TICK)
+
+class BottomFeederPlayer(Player):
+    """
+    Estimates each suit's value as the average of other players' quotes.
+    An agent counts only after k buy orders and k sell orders in that suit.
+    Buy and sell are chosen at random. The quote is that value, rounded.
+    """
+
+    def _expected_value(self, order_book: OrderBookManager, suit: str) -> float | None:
+        """
+        Average, over prey, of the mid between that prey's mean buy and mean sell.
+
+        Prey are the other agents with at least k buy orders and k sell orders
+        in this suit. Each mean uses that agent's k most recent orders on that side.
+        """
+        k = BOTTOM_FEEDER_K
+        buys: dict[int, list[float]] = {}
+        sells: dict[int, list[float]] = {}
+        for order in order_book.order_history:
+            if order["ASSET"] != suit or order["PLAYER"] == self.id:
+                continue
+            side_prices = buys if order["SIDE"] == "BUY" else sells
+            side_prices.setdefault(order["PLAYER"], []).append(order["PRICE"])
+
+        prey_values = []
+        for player_id in set(buys) & set(sells):
+            buy_prices = buys[player_id]
+            sell_prices = sells[player_id]
+            if len(buy_prices) < k or len(sell_prices) < k:
+                continue
+            mean_buy = sum(buy_prices[-k:]) / k
+            mean_sell = sum(sell_prices[-k:]) / k
+            prey_values.append(0.5 * (mean_buy + mean_sell))
+
+        if not prey_values:
+            return None
+        expected = sum(prey_values) / len(prey_values)
+        if not np.isfinite(expected):
+            return None
+        return expected
+
+    async def play(self, order_book: OrderBookManager) -> None:
+        np.random.seed(SEED)
+        while True:
+            prob = np.random.uniform(0, 1)
+            side = "BUY" if prob < 0.5 else "SELL"
+
+            values = {}
+            for suit in SUITS:
+                expected = self._expected_value(order_book, suit)
+                if expected is not None:
+                    values[suit] = expected
+            if values:
+                suit = str(np.random.choice(list(values)))
+                expected = values[suit]
+                price = round(expected)
+                can_buy = side == "BUY" and price >= 1 and self.cash >= price
+                can_sell = side == "SELL" and price >= 1 and self.get_cards_by_suit(suit) > 0
+                if can_buy or can_sell:
+                    logger.debug(
+                        "Player %s quoting %s %s @ %s | value=%.2f",
+                        self.id,
+                        side,
+                        suit,
+                        price,
+                        expected,
+                    )
+                    await order_book.submit_order(suit, side, float(price), self)
+
+            await asyncio.sleep(BOTTOM_FEEDER_TICK)    

@@ -25,12 +25,28 @@ color_to_suit = {
 # Round Time in Seconds
 ROUND_TIME = 2 * 60
 
+# Random player constants
+RANDOM_TICK = 0.1
+RANDOM_MAX_BID = 50
+RANDOM_MIN_OFFER = 1
+
 # Greedy player constants
 MAX_BID = 9
 MIN_OFFER = 1
 GREEDY_START_BID = 1
 GREEDY_START_OFFER = 10
 GREEDY_TICK = 0.1
+
+# Chartist player constants
+CHARTIST_TICK = 0.1
+# Trades looked back when averaging a suit's return. Quoting needs this many
+# plus the current trade and the trade just before it.
+CHARTIST_TAU = 5
+
+# Bottom-feeder player constants
+BOTTOM_FEEDER_TICK = 0.1
+# Buy orders and sell orders required from an agent before it counts as prey.
+BOTTOM_FEEDER_K = 4
 
 
 def setup_logging(log_file: str = "figgie.log", console_level: int | None = None, file_level: int = logging.DEBUG) -> None:

@@ -4,7 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 from utils import *
-from player import Player, GreedyPlayer
+from player import Player, GreedyPlayer, RandomPlayer, ChartistPlayer, BottomFeederPlayer
 import random
 from card import Card
 from order_book import OrderBookManager
@@ -14,7 +14,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CLASS_REGISTRY = {"greedy": GreedyPlayer}
+CLASS_REGISTRY = {
+    "greedy": GreedyPlayer,
+    "random": RandomPlayer,
+    "chartist": ChartistPlayer,
+    "bottom_feeder": BottomFeederPlayer,
+}
 
 
 

@@ -335,6 +335,7 @@ class OrderBookManager:
         self.books: Dict[str, OrderBook] = {asset: OrderBook(asset) for asset in assets}
         self.order_queue: asyncio.Queue = asyncio.Queue()
         self.order_executed: list[dict] = []
+        self.order_history: list[dict] = []
         self._worker: Optional[asyncio.Task] = None
         self._order_id_counter = itertools.count(1)
         self.logging_file = logging_file
@@ -364,6 +365,13 @@ class OrderBookManager:
             party=party,
         )
         await self.order_queue.put(handle)
+        self.order_history.append({
+            "ID": order_id,
+            "PLAYER": party.id,
+            "SIDE": side,
+            "PRICE": price,
+            "ASSET": asset,
+        })
         logger.debug("Queued %s | %s %s @ %s | player=%s", order_id, side, asset, price, party.id)
         return handle
 
