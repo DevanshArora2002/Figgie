@@ -347,6 +347,8 @@ class OrderBookManager:
                 f.close()
         
     def _log_trades(self):
+        if self.logging_file is None:
+            return
         with open(self.logging_file, "a") as f:
             last_trade = self.order_executed[-1]
             with open(self.logging_file, "a") as f:

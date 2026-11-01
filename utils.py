@@ -53,6 +53,12 @@ FUNDAMENTALIST_TICK = 0.1
 # Growth of a card's majority value as the player nears a majority.
 FUNDAMENTALIST_R = 1.5
 
+# Tournament constants
+TOURNAMENT_ROUND_TIME = 10
+TOURNAMENT_TICK = 0.01
+TOURNAMENT_SEEDS = [11, 23, 37]   # at least 2
+TOURNAMENT_TOP5_SEEDS = [11, 23, 37, 51, 73, 89]
+
 
 def setup_logging(log_file: str = "figgie.log", console_level: int | None = None, file_level: int = logging.DEBUG) -> None:
     """Send INFO (or FIGGIE_LOG_LEVEL) to the console and DEBUG to log_file."""

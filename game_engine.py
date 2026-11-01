@@ -4,8 +4,18 @@ import logging
 import time
 from typing import TYPE_CHECKING
 from utils import *
-from player import Player, GreedyPlayer, RandomPlayer, ChartistPlayer, BottomFeederPlayer, FundamentalistPlayer
+from player import (
+    Player,
+    GreedyPlayer,
+    RandomPlayer,
+    ChartistPlayer,
+    BottomFeederPlayer,
+    FundamentalistPlayer,
+    FundamentalistPlayer2,
+    FundamentalistPlayer3,
+)
 import random
+import numpy as np
 from card import Card
 from order_book import OrderBookManager
 
@@ -20,30 +30,45 @@ CLASS_REGISTRY = {
     "chartist": ChartistPlayer,
     "bottom_feeder": BottomFeederPlayer,
     "fundamentalist": FundamentalistPlayer,
+    "fundamentalist2": FundamentalistPlayer2,
+    "fundamentalist3": FundamentalistPlayer3,
 }
 
 
 
 class GameEngine:
-    def __init__(self,player1="greedy",player2="greedy",player3="greedy",player4="greedy",logging_file: str='Sample_logging_Greedy.txt', log_file: str = "figgie.log"):
+    def __init__(
+        self,
+        player1="greedy",
+        player2="greedy",
+        player3="greedy",
+        player4="greedy",
+        logging_file: str | None = "Sample_logging_Greedy.txt",
+        log_file: str = "figgie.log",
+        seed: int = SEED,
+        round_time: float = ROUND_TIME,
+    ):
         setup_logging(log_file=log_file)
-        self.rng = random.Random(SEED)
-        self.players_list: List[Player] = self._initialize_players(player1,player2,player3,player4)
+        self.seed = seed
+        self.round_time = round_time
+        self.rng = random.Random(self.seed)
+        self.players_list: List[Player] = self._initialize_players(player1, player2, player3, player4)
         self.num_rounds = NUM_ROUNDS
         self.current_round = 0
         self.pot = 0
         self.logging_file = logging_file
         logger.info(
-            "Engine ready | classes=%s | rounds=%s | seed=%s | trade_report=%s | debug_log=%s",
+            "Engine ready | classes=%s | rounds=%s | seed=%s | round_time=%s | trade_report=%s | debug_log=%s",
             [player1, player2, player3, player4],
             self.num_rounds,
-            SEED,
+            self.seed,
+            self.round_time,
             logging_file,
             log_file,
         )
 
     def initialize_game(self):
-        self.rng = random.Random(SEED * self.current_round)
+        self.rng = random.Random(self.seed * NUM_ROUNDS + self.current_round)
         for player in self.players_list:
             player.cards_lst.clear()
         logger.debug("Cleared hands before deal")
@@ -65,17 +90,20 @@ class GameEngine:
         for player in self.players_list:
             logger.info("Round %s hand | %s", self.current_round, player)
 
-    def _initialize_players(self,player1: str,player2: str,player3: str,player4: str) -> List[Player]:
-        return [self._create_instance(player1),self._create_instance(player2),self._create_instance(player3),self._create_instance(player4)]
+    def _initialize_players(self, player1: str, player2: str, player3: str, player4: str) -> List[Player]:
+        keys = [player1, player2, player3, player4]
+        return [self._create_instance(key, seat) for seat, key in enumerate(keys)]
 
-    def _create_instance(self,class_key: str, *args, **kwargs) -> Player:
+    def _create_instance(self, class_key: str, seat_index: int) -> Player:
         cls = CLASS_REGISTRY.get(class_key.lower())
         if cls is None:
             logger.error("Unknown player class '%s' | available=%s", class_key, list(CLASS_REGISTRY.keys()))
             raise ValueError(
                 f"Unknown key '{class_key}'. Available: {list(CLASS_REGISTRY.keys())}"
             )
-        player = cls(*args, **kwargs)
+        player = cls()
+        player.strategy = class_key.lower()
+        player.rng = np.random.default_rng([self.seed, seat_index])
         logger.debug("Created %s as player %s", class_key, player.id)
         return player
 
@@ -120,10 +148,10 @@ class GameEngine:
             "Round %s market open | players=%s | duration=%ss",
             round_number,
             [player.id for player in self.players_list],
-            ROUND_TIME,
+            self.round_time,
         )
         started = time.monotonic()
-        await asyncio.sleep(ROUND_TIME)
+        await asyncio.sleep(self.round_time)
         for task in tasks:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -159,6 +187,17 @@ class GameEngine:
             await self._play_round(self.current_round)
             self._post_round_processing()
         logger.info("Game finished after %s round(s) | standings %s", self.current_round, self._standings())
+
+    def results(self) -> list[dict]:
+        return [
+            {
+                "strategy": player.strategy,
+                "player_id": player.id,
+                "cash": player.cash,
+                "rounds": self.current_round,
+            }
+            for player in self.players_list
+        ]
 
     def _standings(self) -> str:
         ranked = sorted(self.players_list, key=lambda player: player.cash, reverse=True)

@@ -47,6 +47,7 @@ class Player(ABC):
         self.id = next(self._id_counter)
         self.cash = STARTING_CASH
         self.cards_lst: List[Card] = []
+        self.rng = np.random.default_rng(SEED)
         logger.debug("Player %s created | cash=%s", self.id, self.cash)
 
     def __repr__(self) -> str:
@@ -294,29 +295,35 @@ class RandomPlayer(Player):
     """
 
     async def play(self, order_book: OrderBookManager) -> None:
-        np.set.seed(SEED)
         while True:
-            prob = np.random.uniform(0, 1)
+            prob = self.rng.uniform(0, 1)
             if prob < 0.5:
                 side = "BUY"
             else:
                 side = "SELL"
             
             if side == "BUY":
-                price = int(np.random.uniform(RANDOM_MIN_OFFER, min(self.cash, RANDOM_MAX_BID)))
-                suit = np.random.choice(SUITS)
-                logger.debug(
+                high = min(self.cash, RANDOM_MAX_BID)
+                if high > RANDOM_MIN_OFFER:
+                    price = int(self.rng.uniform(RANDOM_MIN_OFFER, high))
+                elif high == RANDOM_MIN_OFFER:
+                    price = RANDOM_MIN_OFFER
+                else:
+                    price = None
+                suit = str(self.rng.choice(SUITS))
+                if price is not None:
+                    logger.debug(
                         "Player %s quoting %s %s @ %s",
                         self.id,
                         side,
                         suit,
                         price,
                     )
-                await order_book.submit_order(suit, side, price, self)
+                    await order_book.submit_order(suit, side, price, self)
             elif side == "SELL":
-                suit = np.random.choice(SUITS)
+                suit = str(self.rng.choice(SUITS))
                 if self.get_cards_by_suit(suit) > 0:
-                    price = int(np.random.uniform(RANDOM_MIN_OFFER, RANDOM_MAX_BID))
+                    price = int(self.rng.uniform(RANDOM_MIN_OFFER, RANDOM_MAX_BID))
                     logger.debug(
                         "Player %s quoting %s %s @ %s",
                         self.id,
@@ -362,10 +369,9 @@ class ChartistPlayer(Player):
         return expected
 
     async def play(self, order_book: OrderBookManager) -> None:
-        np.random.seed(SEED)
         needed = CHARTIST_TAU + 2
         while True:
-            prob = np.random.uniform(0, 1)
+            prob = self.rng.uniform(0, 1)
             side = "BUY" if prob < 0.5 else "SELL"
 
             ready = [
@@ -374,7 +380,7 @@ class ChartistPlayer(Player):
                 if len(self._trade_prices(order_book, suit)) >= needed
             ]
             if ready:
-                suit = str(np.random.choice(ready))
+                suit = str(self.rng.choice(ready))
                 expected = self._expected_value(self._trade_prices(order_book, suit))
                 price = round(expected) if expected is not None else 0
                 can_buy = side == "BUY" and price >= 1 and self.cash >= price
@@ -433,9 +439,8 @@ class BottomFeederPlayer(Player):
         return expected
 
     async def play(self, order_book: OrderBookManager) -> None:
-        np.random.seed(SEED)
         while True:
-            prob = np.random.uniform(0, 1)
+            prob = self.rng.uniform(0, 1)
             side = "BUY" if prob < 0.5 else "SELL"
 
             values = {}
@@ -444,7 +449,7 @@ class BottomFeederPlayer(Player):
                 if expected is not None:
                     values[suit] = expected
             if values:
-                suit = str(np.random.choice(list(values)))
+                suit = str(self.rng.choice(list(values)))
                 expected = values[suit]
                 price = round(expected)
                 can_buy = side == "BUY" and price >= 1 and self.cash >= price
@@ -540,7 +545,6 @@ class FundamentalistPlayer(Player):
         )
 
     async def play(self, order_book: OrderBookManager) -> None:
-        np.random.seed(SEED)
         inventory = {suit: {self.id: self.get_cards_by_suit(suit)} for suit in SUITS}
         history_obs = 0
         while True:
@@ -549,14 +553,14 @@ class FundamentalistPlayer(Player):
                 inventory = updated
             history_obs = len(order_book.order_executed)
 
-            suit = str(np.random.choice(SUITS))
+            suit = str(self.rng.choice(SUITS))
             held = self.get_cards_by_suit(suit)
             buy_value = self._get_expected_value(inventory, suit, cards_held=held)
-            prob = np.random.uniform(0, 1)
+            prob = self.rng.uniform(0, 1)
             side = "BUY" if prob < 0.5 else "SELL"
 
             if side == "BUY" and buy_value > 0:
-                price = round(float(np.random.uniform(0, buy_value)))
+                price = round(float(self.rng.uniform(0, buy_value)))
                 offer = order_book.books[suit].ask
                 if offer is not None:
                     price = min(price, round(offer.order_price))
@@ -573,7 +577,7 @@ class FundamentalistPlayer(Player):
             elif side == "SELL" and held > 0:
                 sell_value = self._get_expected_value(inventory, suit, cards_held=held - 1)
                 if sell_value > 0:
-                    price = round(float(np.random.uniform(sell_value, 2 * sell_value)))
+                    price = round(float(self.rng.uniform(sell_value, 2 * sell_value)))
                     bid = order_book.books[suit].bid
                     if bid is not None:
                         price = max(price, round(bid.order_price))
@@ -775,7 +779,7 @@ class FundamentalistPlayer3(FundamentalistPlayer):
                     continue
 
                 price = float(
-                    np.random.uniform(
+                    self.rng.uniform(
                         1,
                         buy_value - 1
                     )
@@ -818,7 +822,7 @@ class FundamentalistPlayer3(FundamentalistPlayer):
 
                 if held <= 0:
                     continue
-                
+
                 sell_value = self._get_expected_value(
                     inventory,
                     suit,
@@ -829,7 +833,7 @@ class FundamentalistPlayer3(FundamentalistPlayer):
                     continue
 
                 price = float(
-                    np.random.uniform(
+                    self.rng.uniform(
                         sell_value,
                         2 * sell_value
                     )
